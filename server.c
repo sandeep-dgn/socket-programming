@@ -1,96 +1,203 @@
 #include "server.h"
+#include <winsock2.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <windows.h>
-#include <time.h>
+#include <process.h>
 
 #define MAX_BUFF 80
-#define SA struct sockaddr
-#define RESET(buff) \
-       { int i; for(i = 0; i < MAX_BUFF; i++) buff[i] = 0; \
-           buff[i]='\0'; }
+#define MAX_CLIENT 5
+#define RESET(buff)               \
+    for (int i = 0; i < MAX_BUFF; i++) \
+        buff[i] = '\0';
 
-void error (const char *msg) {
+typedef struct ClientNode {
+    SOCKET socket;
+    struct ClientNode* next;
+} ClientNode;
+
+ClientNode* clients = NULL;
+CRITICAL_SECTION clients_lock;
+
+void addClient(SOCKET client) {
+    ClientNode* newNode = (ClientNode*)malloc(sizeof(ClientNode));
+    newNode->socket = client;
+    newNode->next = NULL;
+
+    EnterCriticalSection(&clients_lock);
+    if (clients == NULL) {
+        clients = newNode;
+    } else {
+        ClientNode* temp = clients;
+        while (temp->next != NULL) {
+            temp = temp->next;
+        }
+        temp->next = newNode;
+    }
+    LeaveCriticalSection(&clients_lock);
+}
+
+void removeClient(SOCKET client) {
+    EnterCriticalSection(&clients_lock);
+    ClientNode* temp = clients;
+    ClientNode* prev = NULL;
+
+    while (temp != NULL && temp->socket != client) {
+        prev = temp;
+        temp = temp->next;
+    }
+
+    if (temp != NULL) {
+        if (prev == NULL) {
+            clients = temp->next;
+        } else {
+            prev->next = temp->next;
+        }
+        free(temp);
+    }
+    LeaveCriticalSection(&clients_lock);
+}
+
+void broadcastMessage(SOCKET sender, const char* message) {
+    EnterCriticalSection(&clients_lock);
+    ClientNode* temp = clients;
+    while (temp != NULL) {
+        if (temp->socket != sender) {
+            send(temp->socket, message, strlen(message), 0);
+        }
+        temp = temp->next;
+    }
+    LeaveCriticalSection(&clients_lock);
+}
+
+void error(const char *msg)
+{
     perror(msg);
     exit(1);
 }
 
-void readIndefinitely(SOCKET connfd) {
+unsigned __stdcall receiveMessages(void* connfd_ptr) {
+    SOCKET connfd = *(SOCKET*)connfd_ptr;
     char buff[MAX_BUFF];
-    int a;
-    while(1) {
+
+    while (1) {
         RESET(buff);
-        a = recv(connfd, buff, sizeof(buff), 0);  // Use recv instead of read
-        if(a > 0) {
-            printf("Client: %s\n", buff);
+        if (recv(connfd, buff, sizeof(buff), 0) > 0) {
+            // Print the received message on the left side
+            printf("%s\n", buff);
+            fflush(stdout);
+            broadcastMessage(connfd, buff);
         }
+    }
+    return 0; // Return a proper value
+}
 
-        // Add response to client
-        int n = 0;
+// Function to handle communication with a client
+void handleClient(SOCKET connfd, const char* username) {
+    char buff[MAX_BUFF];
+    int n;
+
+    // Create a thread to receive messages from the client
+    HANDLE recv_thread;
+    recv_thread = (HANDLE)_beginthreadex(NULL, 0, receiveMessages, &connfd, 0, NULL);
+
+    // Indefinite loop for chatting with the client
+    while (1) {
+        // Send a response to the client
         RESET(buff);
-        printf("Enter the server response: ");
-        while((buff[n++] = getchar()) != '\n');
-        send(connfd, buff, strlen(buff), 0);  // Use send instead of write
+        n = 0;
+        while ((buff[n++] = getchar()) != '\n');
+        
+        // Prepend "Server: " to the message
+        char message[MAX_BUFF];
+        snprintf(message, sizeof(message), "Server: %s", buff);
+        
+        send(connfd, message, strlen(message), 0);
+        broadcastMessage(connfd, message);
 
-        // Add exit condition
-        if(strcmp("exit\n", buff) == 0) {
+        // Exit condition
+        if (strcmp("Server: exit\n", message) == 0) {
             printf("Server Exit...\n");
             break;
         }
     }
+
+    // Wait for the receive thread to finish
+    WaitForSingleObject(recv_thread, INFINITE);
+    CloseHandle(recv_thread);
+
+    // Close the connection with the client
+    removeClient(connfd);
+    CLOSE_SOCKET(connfd);
 }
 
+// Main server function
 int main(int argc, char const *argv[]) {
-    int MAX_CLIENT = 5;
     SOCKET sockfd, newsockfd;
     struct sockaddr_in serv_addr, cli_addr;
     int clilen;
 
-    // Initialize sockets for Windows
+    // Initialize Windows sockets
     if (INIT_SOCKETS() != 0) {
         error("WSAStartup failed");
     }
 
-    // Check the provided port number
-    if (argc < 2)
+    if (argc < 2) {
         error("Port number not provided");
+    }
 
+    // Setup server address and port
     serv_addr.sin_family = AF_INET;
     serv_addr.sin_addr.s_addr = INADDR_ANY;
     serv_addr.sin_port = htons(atoi(argv[1]));
 
-    // Socket creation
-    if ((sockfd = socket(AF_INET, SOCK_STREAM, 0)) < 0)
-        error("Error in creating socket");
-    else
-        printf("Socket created successfully ...\n");
-
-    // Binding
-    if (bind(sockfd, (SA *)&serv_addr, sizeof(serv_addr)) < 0)
-        error("Error in binding");
-    else
-        printf("Binding to Port : %s \n", argv[1]);
-
-    // Listening
-    if (listen(sockfd, MAX_CLIENT) != 0) {
-        error("Error in listening ...");
-    } else {
-        printf("Started listening for max %d clients...\n", MAX_CLIENT);
+    // Create server socket
+    if ((sockfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+        error("Error in socket creation");
     }
 
-    // Accept connections
+    // Bind the server socket
+    if (bind(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+        error("Error in binding");
+    }
+
+    // Listen for incoming connections
+    if (listen(sockfd, MAX_CLIENT) != 0) {
+        error("Error in listening");
+    } else {
+        printf("Server listening on port %s...\n", argv[1]);
+    }
+
+    InitializeCriticalSection(&clients_lock);
+
+    // Accept and handle client connections in separate threads
     clilen = sizeof(cli_addr);
-    newsockfd = accept(sockfd, (SA *)&cli_addr, (socklen_t *)&clilen);
-    if (newsockfd < 0)
-        error("Error in accept");
-    else
-        printf("Accepted the client: %d\n", newsockfd);
+    while (1) {
+        newsockfd = accept(sockfd, (struct sockaddr *)&cli_addr, &clilen);
+        if (newsockfd < 0) {
+            error("Error in accept");
+        } else {
+            // Receive the username from the client
+            char username[MAX_BUFF];
+            int bytes_received = recv(newsockfd, username, sizeof(username) - 1, 0);
+            if (bytes_received > 0) {
+                username[bytes_received] = '\0'; // Null-terminate the received string
+                printf("%s joined the chat\n", username);
+            }
 
-    // Start chatting
-    readIndefinitely(newsockfd);
+            // Add the new client to the list
+            addClient(newsockfd);
 
-    CLOSE_SOCKET(newsockfd);
+            // Create a new thread to handle communication with the client
+            DWORD threadId;
+            CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)handleClient, (LPVOID)newsockfd, 0, &threadId);
+        }
+    }
 
     // Cleanup sockets for Windows
     CLEANUP_SOCKETS();
+    DeleteCriticalSection(&clients_lock);
 
     return 0;
 }

@@ -2,7 +2,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <winsock2.h>  // Required for Winsock functions
+#include <winsock2.h>
+#include <windows.h>
 
 #define MAX_BUFF 80
 #define SA struct sockaddr
@@ -16,10 +17,32 @@ void error(const char *msg)
     exit(1);
 }
 
-void readIndefinitely(SOCKET connfd)
+DWORD WINAPI receiveMessages(LPVOID connfd_ptr) {
+    SOCKET connfd = *(SOCKET*)connfd_ptr;
+    char buffer[MAX_BUFF];
+
+    while (1) {
+        RESET(buffer);
+        if (recv(connfd, buffer, sizeof(buffer), 0) > 0) {
+            // Print the received message on the left side
+            printf("%s\n", buffer);
+            fflush(stdout);
+        }
+    }
+    return 0; // Return a proper value
+}
+
+void readIndefinitely(SOCKET connfd, const char* username)
 {
     char buffer[MAX_BUFF];
     int n;
+
+    // Send the username to the server
+    send(connfd, username, strlen(username), 0);
+
+    // Create a thread to receive messages from the server
+    HANDLE recv_thread;
+    recv_thread = CreateThread(NULL, 0, receiveMessages, &connfd, 0, NULL);
 
     // Indefinite loop for chat
     while (1)
@@ -29,9 +52,13 @@ void readIndefinitely(SOCKET connfd)
 
         // Send the data
         n = 0;
-        printf("Enter the data: ");
         while ((buffer[n++] = getchar()) != '\n');
-        send(connfd, buffer, strlen(buffer), 0);  // Use send instead of write
+        
+        // Prepend the username to the message
+        char message[MAX_BUFF];
+        snprintf(message, sizeof(message), "%s: %s", username, buffer);
+        
+        send(connfd, message, strlen(message), 0);
 
         // Add exit condition
         if (strcmp("exit\n", buffer) == 0)
@@ -39,19 +66,18 @@ void readIndefinitely(SOCKET connfd)
             printf("Client Exit ...\n");
             break;
         }
-
-        // Read the data from server into buffer
-        if (recv(connfd, buffer, sizeof(buffer), 0) > 0)  // Use recv instead of read
-        {
-            printf("From Server : %s", buffer);
-        }
     }
+
+    // Wait for the receive thread to finish
+    WaitForSingleObject(recv_thread, INFINITE);
+    CloseHandle(recv_thread);
 }
 
 int main(int argc, char const *argv[])
 {
     SOCKET sockfd;
     struct sockaddr_in serv_addr;
+    char username[MAX_BUFF];
 
     // Initialize sockets for Windows
     if (INIT_SOCKETS() != 0) {
@@ -61,6 +87,11 @@ int main(int argc, char const *argv[])
     // Checking the provided port no
     if (argc < 3)
         error("Port No not provided");
+
+    // Prompt for username
+    printf("Enter your username: ");
+    fgets(username, MAX_BUFF, stdin);
+    username[strcspn(username, "\n")] = 0; // Remove newline character
 
     serv_addr.sin_family = AF_INET;
     serv_addr.sin_addr.s_addr = inet_addr(argv[1]);
@@ -75,7 +106,7 @@ int main(int argc, char const *argv[])
         error("Error in Connecting to server ..");
 
     // Start communication
-    readIndefinitely(sockfd);
+    readIndefinitely(sockfd, username);
 
     // Close the socket
     CLOSE_SOCKET(sockfd);
@@ -85,3 +116,4 @@ int main(int argc, char const *argv[])
 
     return 0;
 }
+
